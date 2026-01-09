@@ -1,0 +1,920 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#-------------------------------------------------------------------------------
+# Name:        laz_orientation_enhanced.py
+# Purpose:     Advanced analysis of LAZ files to determine flight line orientation
+#              using multiple algorithms: PCA, RANSAC, density analysis, and scan angles.
+#              Automatically detects flight lines without trajectory metadata.
+#
+# Author:      EarthDefine - Enhanced Version
+# Created:     06/12/2025     
+# Copyright:   (c) EarthDefine 2025
+# Licence:     <your licence>
+#-------------------------------------------------------------------------------
+
+import os
+import sys
+import subprocess
+import re
+import argparse
+import random
+import glob
+import time
+import math
+import numpy as np
+from collections import defaultdict
+import warnings
+warnings.filterwarnings('ignore')
+
+# Optional imports - install if available
+try:
+    import laspy
+    LASPY_AVAILABLE = True
+except ImportError:
+    LASPY_AVAILABLE = False
+    print("Warning: laspy not installed. Install with: pip install laspy")
+
+try:
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import DBSCAN
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    print("Warning: scikit-learn not installed. Install with: pip install scikit-learn")
+
+try:
+    import pyransac3d as pyrsc
+    RANSAC_AVAILABLE = True
+except ImportError:
+    RANSAC_AVAILABLE = False
+    print("Warning: pyransac3d not installed. Install with: pip install pyransac3d")
+
+#-------------------------------------------------------------------------------
+# Constants
+#-------------------------------------------------------------------------------
+LASINFO_PATH = r"c:\geostack3\lastools\bin\lasinfo.exe"
+NORTH_ORIENTED_THRESHOLD = 30  # Threshold percentage for multiple files
+DEFAULT_PCT_CHECK = 10  # Default percentage
+DEFAULT_ANGLE_TOLERANCE = 45.0  # Default angle tolerance in degrees
+
+# PCA parameters
+MIN_LINEARITY = 0.7  # Minimum linearity for PCA detection
+MIN_POINTS_PER_NEIGHBORHOOD = 100  # Minimum points for neighborhood analysis
+
+# RANSAC parameters
+RANSAC_LINE_THRESHOLD = 0.5  # Distance threshold for line fitting
+RANSAC_MAX_ITERATIONS = 1000
+
+# Density analysis parameters
+DBSCAN_EPS_FACTOR = 2.0  # Factor for automatic eps calculation
+DBSCAN_MIN_SAMPLES = 50
+
+#-------------------------------------------------------------------------------
+# Time utility functions (unchanged from original)
+#-------------------------------------------------------------------------------
+def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=50, fill='█'):
+    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
+    filledLength = int(length * iteration // total)
+    bar = fill * filledLength + '-' * (length - filledLength)
+    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end='\r')
+    if iteration == total: 
+        print()
+
+def printStartTime():
+    start_time = time.time()
+    print("Script started: {}".format(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))))
+    print("-" * 60)
+    return start_time
+
+def printRunTime(start_time):
+    end_time = time.time()
+    elapsed = end_time - start_time
+    hours = int(elapsed // 3600)
+    minutes = int((elapsed % 3600) // 60)
+    seconds = int(elapsed % 60)
+    print("-" * 60)
+    print("Execution time: {:02d}:{:02d}:{:02d}".format(hours, minutes, seconds))
+
+#-------------------------------------------------------------------------------
+# Enhanced file loading functions
+#-------------------------------------------------------------------------------
+def load_las_file_with_laspy(filename):
+    """
+    Load LAZ/LAS file using laspy library for better attribute access
+    
+    Returns:
+        dict: Contains points, scan angles, point source IDs, and other metadata
+    """
+    try:
+        with laspy.open(filename) as las_file:
+            las = las_file.read()
+        
+        # Extract coordinates
+        points = np.vstack((las.x, las.y, las.z)).transpose()
+        
+        # Extract flight line related attributes if available
+        flight_info = {}
+        
+        # Scan angle information (crucial for flight line detection)
+        if hasattr(las, 'scan_angle_rank'):
+            flight_info['scan_angles'] = las.scan_angle_rank
+        elif hasattr(las, 'scan_angle'):
+            flight_info['scan_angles'] = las.scan_angle
+            
+        # Point source ID (often corresponds to flight line number)
+        if hasattr(las, 'point_source_id'):
+            flight_info['point_source_ids'] = las.point_source_id
+            
+        # Edge of flight line flag
+        if hasattr(las, 'edge_of_flight_line'):
+            flight_info['edge_flags'] = las.edge_of_flight_line
+            
+        # Scan direction flag
+        if hasattr(las, 'scan_direction_flag'):
+            flight_info['scan_direction'] = las.scan_direction_flag
+            
+        return {
+            'points': points,
+            'flight_info': flight_info,
+            'header': las.header,
+            'bounds': {
+                'min_x': las.header.min[0],
+                'max_x': las.header.max[0],
+                'min_y': las.header.min[1],
+                'max_y': las.header.max[1],
+                'min_z': las.header.min[2],
+                'max_z': las.header.max[2]
+            }
+        }
+    except Exception as e:
+        print(f"Error loading file with laspy: {e}")
+        return None
+
+#-------------------------------------------------------------------------------
+# Original lasinfo functions (kept for compatibility)
+#-------------------------------------------------------------------------------
+def get_lasinfo(file_path):
+    """Original lasinfo function - unchanged"""
+    try:
+        if not os.path.exists(file_path):
+            return "Error: File does not exist: {}".format(file_path)
+        
+        if not os.path.exists(LASINFO_PATH):
+            return "Error: lasinfo.exe not found at: {}".format(LASINFO_PATH)
+        
+        command = '"{}" "{}"'.format(LASINFO_PATH, os.path.abspath(file_path))
+        
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            shell=True
+        )
+        
+        output, _ = process.communicate(input='\n')
+        
+        if output and ("min x y z" in output or "min x" in output or "X" in output):
+            return output
+        
+        command_no_check = '"{}" -no_check "{}"'.format(LASINFO_PATH, os.path.abspath(file_path))
+        process = subprocess.Popen(
+            command_no_check,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            shell=True
+        )
+        
+        output, _ = process.communicate(input='\n')
+        
+        if output:
+            return output
+        else:
+            return "Error executing lasinfo: No output"
+        
+    except Exception as e:
+        return "Unexpected error: {}".format(str(e))
+
+def extract_bounds(lasinfo_output, debug=False):
+    """Original bounds extraction - unchanged"""
+    bounds = {}
+    
+    if debug:
+        print("\n--- DEBUG: First 1000 characters of lasinfo ---")
+        print(lasinfo_output[:1000])
+        print("--- END DEBUG ---\n")
+    
+    min_pattern = r'min x y z:\s+([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)'
+    max_pattern = r'max x y z:\s+([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)'
+    
+    min_match = re.search(min_pattern, lasinfo_output, re.IGNORECASE)
+    max_match = re.search(max_pattern, lasinfo_output, re.IGNORECASE)
+    
+    if min_match and max_match:
+        bounds['min_x'] = float(min_match.group(1))
+        bounds['min_y'] = float(min_match.group(2))
+        bounds['max_x'] = float(max_match.group(1))
+        bounds['max_y'] = float(max_match.group(2))
+        
+        if debug:
+            print(f"  Found min x y z: {min_match.group(1)}, {min_match.group(2)}, {min_match.group(3)}")
+            print(f"  Found max x y z: {max_match.group(1)}, {max_match.group(2)}, {max_match.group(3)}")
+        
+        return bounds
+    
+    # Alternative patterns (rest unchanged)
+    x_table_pattern = r'^\s*X\s+([0-9]+)\s+([0-9]+)'
+    y_table_pattern = r'^\s*Y\s+([0-9]+)\s+([0-9]+)'
+    
+    x_table_match = re.search(x_table_pattern, lasinfo_output, re.MULTILINE)
+    y_table_match = re.search(y_table_pattern, lasinfo_output, re.MULTILINE)
+    
+    if x_table_match and y_table_match:
+        bounds['min_x'] = float(x_table_match.group(1))
+        bounds['max_x'] = float(x_table_match.group(2))
+        bounds['min_y'] = float(y_table_match.group(1))
+        bounds['max_y'] = float(y_table_match.group(2))
+        return bounds
+    
+    return bounds
+
+#-------------------------------------------------------------------------------
+# NEW: PCA-based flight line detection
+#-------------------------------------------------------------------------------
+def detect_flight_lines_pca(points, min_linearity=MIN_LINEARITY, neighborhood_size=1000):
+    """
+    Detect flight lines using Principal Component Analysis
+    
+    Args:
+        points: Nx3 array of point coordinates
+        min_linearity: Minimum linearity threshold
+        neighborhood_size: Size of neighborhoods to analyze
+        
+    Returns:
+        list: Detected flight line orientations
+    """
+    if not SKLEARN_AVAILABLE:
+        return []
+    
+    flight_lines = []
+    n_points = len(points)
+    
+    # Sample points for efficiency
+    if n_points > 10000:
+        sample_indices = np.random.choice(n_points, 10000, replace=False)
+        sampled_points = points[sample_indices]
+    else:
+        sampled_points = points
+    
+    # Analyze neighborhoods
+    pca = PCA(n_components=3)
+    
+    for i in range(0, len(sampled_points), neighborhood_size // 2):
+        neighborhood = sampled_points[i:i+neighborhood_size]
+        
+        if len(neighborhood) < MIN_POINTS_PER_NEIGHBORHOOD:
+            continue
+        
+        # Center the points
+        centered = neighborhood - np.mean(neighborhood, axis=0)
+        
+        try:
+            pca.fit(centered)
+            eigenvalues = pca.explained_variance_
+            
+            # Calculate linearity (σ₁ - σ₂) / σ₁
+            if eigenvalues[0] > 0:
+                linearity = (eigenvalues[0] - eigenvalues[1]) / eigenvalues[0]
+                
+                if linearity > min_linearity:
+                    # Extract principal direction
+                    principal_direction = pca.components_[0]
+                    
+                    # Convert to angle (relative to North/Y-axis)
+                    angle_rad = math.atan2(principal_direction[0], principal_direction[1])
+                    angle_deg = math.degrees(angle_rad)
+                    
+                    if angle_deg < 0:
+                        angle_deg += 360
+                    
+                    flight_lines.append({
+                        'direction': principal_direction,
+                        'angle_degrees': angle_deg,
+                        'linearity': linearity,
+                        'center': np.mean(neighborhood, axis=0)
+                    })
+        except:
+            continue
+    
+    return flight_lines
+
+#-------------------------------------------------------------------------------
+# NEW: RANSAC-based flight line detection
+#-------------------------------------------------------------------------------
+def detect_flight_lines_ransac(points, threshold=RANSAC_LINE_THRESHOLD, max_iterations=RANSAC_MAX_ITERATIONS):
+    """
+    Detect flight lines using RANSAC algorithm
+    
+    Returns:
+        list: Detected flight line parameters
+    """
+    if not RANSAC_AVAILABLE:
+        return []
+    
+    flight_lines = []
+    remaining_points = points.copy()
+    
+    # Detect multiple lines
+    max_lines = 5  # Maximum number of lines to detect
+    
+    for _ in range(max_lines):
+        if len(remaining_points) < 100:
+            break
+        
+        try:
+            # Fit a line using RANSAC
+            line = pyrsc.Line()
+            best_eq, best_inliers = line.fit(remaining_points, thresh=threshold, maxIteration=max_iterations)
+            
+            if len(best_inliers) < 50:  # Minimum points for a valid line
+                break
+            
+            # Extract line direction
+            line_point = best_eq[0:3]
+            line_direction = best_eq[3:6]
+            
+            # Normalize direction
+            line_direction = line_direction / np.linalg.norm(line_direction)
+            
+            # Calculate angle
+            angle_rad = math.atan2(line_direction[0], line_direction[1])
+            angle_deg = math.degrees(angle_rad)
+            
+            if angle_deg < 0:
+                angle_deg += 360
+            
+            flight_lines.append({
+                'point': line_point,
+                'direction': line_direction,
+                'angle_degrees': angle_deg,
+                'num_inliers': len(best_inliers)
+            })
+            
+            # Remove inliers for next iteration
+            remaining_points = np.delete(remaining_points, best_inliers, axis=0)
+            
+        except Exception as e:
+            break
+    
+    return flight_lines
+
+#-------------------------------------------------------------------------------
+# NEW: Scan angle-based flight line detection
+#-------------------------------------------------------------------------------
+def analyze_scan_angles(scan_angles, points):
+    """
+    Analyze scan angle patterns to detect flight lines
+    
+    Args:
+        scan_angles: Array of scan angles
+        points: Nx3 array of point coordinates
+        
+    Returns:
+        dict: Flight line orientation based on scan patterns
+    """
+    if scan_angles is None or len(scan_angles) == 0:
+        return None
+    
+    # Group points by scan angle ranges
+    angle_groups = defaultdict(list)
+    
+    for i, angle in enumerate(scan_angles):
+        # Group into bins of 10 degrees
+        bin_angle = int(angle / 10) * 10
+        angle_groups[bin_angle].append(i)
+    
+    # Analyze spatial distribution of each angle group
+    flight_directions = []
+    
+    for angle_bin, indices in angle_groups.items():
+        if len(indices) < 100:
+            continue
+        
+        group_points = points[indices]
+        
+        # Calculate principal direction for this scan angle group
+        if SKLEARN_AVAILABLE:
+            pca = PCA(n_components=2)
+            points_2d = group_points[:, :2]  # Use only X,Y
+            
+            try:
+                pca.fit(points_2d - np.mean(points_2d, axis=0))
+                principal_dir = pca.components_[0]
+                
+                angle_rad = math.atan2(principal_dir[0], principal_dir[1])
+                angle_deg = math.degrees(angle_rad)
+                
+                if angle_deg < 0:
+                    angle_deg += 360
+                
+                flight_directions.append(angle_deg)
+            except:
+                continue
+    
+    if flight_directions:
+        # Calculate average direction
+        avg_direction = np.mean(flight_directions)
+        return {
+            'average_direction': avg_direction,
+            'num_scan_groups': len(flight_directions)
+        }
+    
+    return None
+
+#-------------------------------------------------------------------------------
+# NEW: Density-based flight strip detection
+#-------------------------------------------------------------------------------
+def detect_flight_strips_density(points, eps_factor=DBSCAN_EPS_FACTOR):
+    """
+    Detect flight strips using density-based clustering
+    
+    Returns:
+        list: Flight strip orientations
+    """
+    if not SKLEARN_AVAILABLE:
+        return []
+    
+    # Use only X,Y coordinates for clustering
+    points_2d = points[:, :2]
+    
+    # Subsample if too many points
+    if len(points_2d) > 5000:
+        indices = np.random.choice(len(points_2d), 5000, replace=False)
+        points_2d = points_2d[indices]
+    
+    # Calculate adaptive eps using k-nearest neighbors
+    from sklearn.neighbors import NearestNeighbors
+    
+    k = min(10, len(points_2d) - 1)
+    nbrs = NearestNeighbors(n_neighbors=k).fit(points_2d)
+    distances, _ = nbrs.kneighbors(points_2d)
+    
+    # Use the average of k-th nearest neighbor distances
+    eps = np.mean(distances[:, -1]) * eps_factor
+    
+    # Perform DBSCAN clustering
+    dbscan = DBSCAN(eps=eps, min_samples=DBSCAN_MIN_SAMPLES)
+    labels = dbscan.fit_predict(points_2d)
+    
+    # Analyze each cluster
+    flight_strips = []
+    unique_labels = set(labels)
+    unique_labels.discard(-1)  # Remove noise label
+    
+    for label in unique_labels:
+        cluster_points = points_2d[labels == label]
+        
+        if len(cluster_points) < 100:
+            continue
+        
+        # PCA on cluster
+        pca = PCA(n_components=2)
+        pca.fit(cluster_points - np.mean(cluster_points, axis=0))
+        
+        # Get principal direction
+        principal_dir = pca.components_[0]
+        angle_rad = math.atan2(principal_dir[0], principal_dir[1])
+        angle_deg = math.degrees(angle_rad)
+        
+        if angle_deg < 0:
+            angle_deg += 360
+        
+        flight_strips.append({
+            'angle_degrees': angle_deg,
+            'num_points': len(cluster_points),
+            'cluster_id': label
+        })
+    
+    return flight_strips
+
+#-------------------------------------------------------------------------------
+# Enhanced orientation detection combining multiple methods
+#-------------------------------------------------------------------------------
+def enhanced_flight_line_detection(file_path, debug=False, tolerance_degrees=45):
+    """
+    Comprehensive flight line detection using multiple algorithms
+    
+    Returns:
+        dict: Detailed orientation analysis results
+    """
+    results = {
+        'file': os.path.basename(file_path),
+        'methods_used': [],
+        'flight_line_orientations': [],  # Changed: specifically for flight lines
+        'final_flight_orientation': None,  # Changed: flight line orientation
+        'is_north_oriented': None,  # This will be based on overall shape, not flight lines
+        'dataset_bounds': None,  # Store bounds for north orientation check
+        'confidence': 'low'
+    }
+    
+    # Method 1: Try loading with laspy for advanced analysis
+    if LASPY_AVAILABLE:
+        las_data = load_las_file_with_laspy(file_path)
+        
+        if las_data and las_data['points'] is not None:
+            points = las_data['points']
+            flight_info = las_data['flight_info']
+            
+            # Method 1a: PCA analysis
+            if SKLEARN_AVAILABLE:
+                pca_lines = detect_flight_lines_pca(points)
+                if pca_lines:
+                    results['methods_used'].append('PCA')
+                    pca_angles = [line['angle_degrees'] for line in pca_lines]
+                    results['flight_line_orientations'].extend(pca_angles)
+                    
+                    if debug:
+                        print(f"  PCA detected {len(pca_lines)} flight lines")
+            
+            # Method 1b: RANSAC analysis
+            if RANSAC_AVAILABLE:
+                ransac_lines = detect_flight_lines_ransac(points)
+                if ransac_lines:
+                    results['methods_used'].append('RANSAC')
+                    ransac_angles = [line['angle_degrees'] for line in ransac_lines]
+                    results['flight_line_orientations'].extend(ransac_angles)
+                    
+                    if debug:
+                        print(f"  RANSAC detected {len(ransac_lines)} flight lines")
+            
+            # Method 1c: Scan angle analysis
+            if 'scan_angles' in flight_info:
+                scan_analysis = analyze_scan_angles(flight_info['scan_angles'], points)
+                if scan_analysis:
+                    results['methods_used'].append('Scan Angles')
+                    results['flight_line_orientations'].append(scan_analysis['average_direction'])
+                    
+                    if debug:
+                        print(f"  Scan angle analysis: {scan_analysis['average_direction']:.1f}°")
+            
+            # Method 1d: Density-based clustering
+            if SKLEARN_AVAILABLE:
+                flight_strips = detect_flight_strips_density(points)
+                if flight_strips:
+                    results['methods_used'].append('Density Clustering')
+                    strip_angles = [strip['angle_degrees'] for strip in flight_strips]
+                    results['flight_line_orientations'].extend(strip_angles)
+                    
+                    if debug:
+                        print(f"  Density clustering detected {len(flight_strips)} strips")
+            
+            # Store bounds from laspy data
+            results['dataset_bounds'] = las_data['bounds']
+    
+    # Method 2: Fallback to original bounding box method
+    lasinfo_output = get_lasinfo(file_path)
+    if "Error" not in lasinfo_output:
+        bounds = extract_bounds(lasinfo_output, debug=debug)
+        
+        if bounds and all(key in bounds for key in ['min_x', 'max_x', 'min_y', 'max_y']):
+            # Store bounds for north orientation check
+            if not results['dataset_bounds']:
+                results['dataset_bounds'] = bounds
+            
+            dx = bounds['max_x'] - bounds['min_x']
+            dy = bounds['max_y'] - bounds['min_y']
+            
+            if dx > 0 and dy > 0:
+                # Flight line detection (if no other methods worked)
+                if not results['flight_line_orientations']:
+                    # For flight lines: use the longer dimension as the flight direction
+                    if dy > dx:  # Flight lines run North-South
+                        flight_angle = 0.0  # North
+                    else:  # Flight lines run East-West
+                        flight_angle = 90.0  # East
+                    
+                    results['methods_used'].append('Bounding Box (Flight Lines)')
+                    results['flight_line_orientations'].append(flight_angle)
+                
+                # Store aspect ratio for confidence calculation
+                aspect_ratio = max(dx, dy) / min(dx, dy)
+                results['aspect_ratio'] = aspect_ratio
+    
+    # Combine flight line results
+    if results['flight_line_orientations']:
+        # Convert angles to unit vectors for proper averaging
+        angles_rad = [math.radians(angle) for angle in results['flight_line_orientations']]
+        
+        # Calculate average using circular statistics
+        sin_sum = sum(math.sin(2 * angle) for angle in angles_rad)
+        cos_sum = sum(math.cos(2 * angle) for angle in angles_rad)
+        
+        avg_angle_rad = 0.5 * math.atan2(sin_sum, cos_sum)
+        avg_angle_deg = math.degrees(avg_angle_rad)
+        
+        if avg_angle_deg < 0:
+            avg_angle_deg += 180  # Normalize to 0-180 range
+        
+        results['final_flight_orientation'] = avg_angle_deg
+    
+    # CRITICAL: Determine north orientation based on DATASET SHAPE, not flight lines
+    if results['dataset_bounds']:
+        bounds = results['dataset_bounds']
+        width = bounds['max_x'] - bounds['min_x']
+        height = bounds['max_y'] - bounds['min_y']
+        
+        # North oriented means height > width (taller than wide)
+        results['is_north_oriented'] = height > width
+        
+        # Calculate the orientation angle of the dataset shape
+        dataset_angle_rad = math.atan2(width, height)
+        dataset_angle_deg = math.degrees(dataset_angle_rad)
+        if dataset_angle_deg < 0:
+            dataset_angle_deg += 360
+        
+        results['dataset_shape_angle'] = dataset_angle_deg
+        results['dataset_width'] = width
+        results['dataset_height'] = height
+        results['dataset_aspect_ratio'] = height / width if width > 0 else 0
+        
+        if debug:
+            print(f"  Dataset shape: width={width:.2f}, height={height:.2f}")
+            print(f"  Dataset aspect ratio (H/W): {results['dataset_aspect_ratio']:.3f}")
+            print(f"  Dataset north-oriented: {results['is_north_oriented']}")
+    
+    # Calculate confidence
+    if results['flight_line_orientations']:
+        num_methods = len(results['methods_used'])
+        
+        if num_methods >= 3:
+            results['confidence'] = 'high'
+        elif num_methods >= 2:
+            results['confidence'] = 'medium'
+        else:
+            results['confidence'] = 'low'
+        
+        # Adjust confidence based on aspect ratio
+        if 'aspect_ratio' in results and results['aspect_ratio'] > 2:
+            if results['confidence'] == 'low':
+                results['confidence'] = 'medium'
+            elif results['confidence'] == 'medium':
+                results['confidence'] = 'high'
+    
+    return results
+
+#-------------------------------------------------------------------------------
+# Main orientation checking function (enhanced)
+#-------------------------------------------------------------------------------
+def check_file_orientation_enhanced(file_path, debug=False, tolerance_degrees=45):
+    """
+    Enhanced orientation checking using multiple methods
+    """
+    try:
+        results = enhanced_flight_line_detection(file_path, debug, tolerance_degrees)
+        
+        if results['is_north_oriented'] is not None:
+            return {
+                'is_north_oriented': results['is_north_oriented'],  # Based on dataset shape
+                'flight_line_angle': results['final_flight_orientation'],  # Flight line direction
+                'dataset_shape_angle': results.get('dataset_shape_angle', None),
+                'dataset_aspect_ratio': results.get('dataset_aspect_ratio', None),
+                'confidence': results['confidence'],
+                'methods_used': results['methods_used']
+            }
+        else:
+            return None
+            
+    except Exception as e:
+        if debug:
+            print(f"Error in enhanced detection: {e}")
+        return None
+
+#-------------------------------------------------------------------------------
+# Utility functions (unchanged from original)
+#-------------------------------------------------------------------------------
+def get_cardinal_direction(angle_deg):
+    """Gets cardinal direction based on angle"""
+    # Normalize to 0-180 range since flight lines don't have direction
+    angle_deg = angle_deg % 180
+    
+    if angle_deg <= 22.5 or angle_deg > 157.5:
+        return "North-South"
+    elif 67.5 < angle_deg <= 112.5:
+        return "East-West"
+    elif 22.5 < angle_deg <= 67.5:
+        return "Northeast-Southwest"
+    elif 112.5 < angle_deg <= 157.5:
+        return "Northwest-Southeast"
+    else:
+        return "Unknown"
+
+def get_adaptive_sample_percentage(total_files):
+    """Gets adaptive sample percentage based on dataset size"""
+    if total_files < 100:
+        return 30.0
+    elif total_files > 2500:
+        return 5.0
+    else:
+        return 10.0
+
+def get_laz_files(path):
+    """Gets all LAZ files from a path"""
+    laz_files = []
+    
+    if os.path.isfile(path):
+        if path.lower().endswith(('.laz', '.las')):
+            laz_files = [path]
+        else:
+            print("Warning: File does not have .laz or .las extension")
+    elif os.path.isdir(path):
+        patterns = ['*.laz', '*.LAZ', '*.las', '*.LAS']
+        for pattern in patterns:
+            laz_files.extend(glob.glob(os.path.join(path, pattern)))
+    else:
+        print("Error: Specified path does not exist")
+    
+    return laz_files
+
+#-------------------------------------------------------------------------------
+# Main function (enhanced)
+#-------------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description='Advanced flight line orientation detection for LAZ/LAS files',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('path', help='Path to LAZ/LAS file or directory')
+    parser.add_argument('--pct_check', type=float, default=DEFAULT_PCT_CHECK, 
+                       help='Percentage of files to check (0-100)')
+    parser.add_argument('--threshold', type=float, default=NORTH_ORIENTED_THRESHOLD,
+                       help='Threshold percentage to consider dataset north-oriented')
+    parser.add_argument('--debug', action='store_true',
+                       help='Shows debug information')
+    parser.add_argument('--save_lasinfo', type=str,
+                       help='Saves lasinfo output from first file')
+    parser.add_argument('--angle_tolerance', type=float, default=DEFAULT_ANGLE_TOLERANCE,
+                       help='Angle tolerance in degrees')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Shows detailed information')
+    parser.add_argument('--method', choices=['all', 'pca', 'ransac', 'density', 'bbox'], 
+                       default='all', help='Detection method to use')
+    
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+    
+    args = parser.parse_args()
+    
+    # Check available libraries
+    print("Available analysis methods:")
+    print(f"  - Bounding Box Analysis: Yes (always available)")
+    print(f"  - PCA Analysis: {'Yes' if SKLEARN_AVAILABLE else 'No (install scikit-learn)'}")
+    print(f"  - RANSAC Analysis: {'Yes' if RANSAC_AVAILABLE else 'No (install pyransac3d)'}")
+    print(f"  - Advanced LAS Analysis: {'Yes' if LASPY_AVAILABLE else 'No (install laspy)'}")
+    print()
+    
+    stime = printStartTime()
+    
+    laz_files = get_laz_files(args.path)
+    
+    if not laz_files:
+        print("No LAZ/LAS files found")
+        return
+    
+    total_files = len(laz_files)
+    print("Found {} LAZ/LAS files".format(total_files))
+    
+    # Adaptive sampling
+    if args.pct_check == DEFAULT_PCT_CHECK:
+        adaptive_pct = get_adaptive_sample_percentage(total_files)
+        args.pct_check = adaptive_pct
+        print("Using adaptive sampling based on dataset size")
+    
+    if 0 < args.pct_check < 100 and len(laz_files) > 1:
+        num_files = max(1, int(len(laz_files) * args.pct_check / 100))
+        laz_files = random.sample(laz_files, num_files)
+        print("Analyzing a sample of {} files ({}%)".format(num_files, args.pct_check))
+    
+    # Save lasinfo if requested
+    if args.save_lasinfo and laz_files:
+        print("\nSaving lasinfo output to: {}".format(args.save_lasinfo))
+        lasinfo_output = get_lasinfo(laz_files[0])
+        try:
+            with open(args.save_lasinfo, 'w', encoding='utf-8') as f:
+                f.write(lasinfo_output)
+            print("Lasinfo output saved successfully")
+        except Exception as e:
+            print("Error saving lasinfo: {}".format(e))
+    
+    # Analyze files
+    north_oriented_count = 0
+    checked_count = 0
+    errors_count = 0
+    angle_sum = 0.0
+    confidence_scores = {'high': 0, 'medium': 0, 'low': 0}
+    
+    print("\nAnalyzing files...")
+    
+    # Verbose mode - show first 3 files
+    if args.verbose and len(laz_files) > 0:
+        print("\n" + "="*60)
+        print("VERBOSE MODE: Detailed analysis of first 3 files")
+        print("="*60)
+        
+        for i, file_path in enumerate(laz_files[:3]):
+            print(f"\nFile {i+1}: {os.path.basename(file_path)}")
+            result = check_file_orientation_enhanced(file_path, debug=True, 
+                                                   tolerance_degrees=args.angle_tolerance)
+            if result:
+                print(f"  Methods used: {', '.join(result['methods_used'])}")
+                if result['flight_line_angle'] is not None:
+                    print(f"  Flight line orientation: {result['flight_line_angle']:.1f}° ({get_cardinal_direction(result['flight_line_angle'])})")
+                if result['dataset_aspect_ratio'] is not None:
+                    print(f"  Dataset aspect ratio (H/W): {result['dataset_aspect_ratio']:.3f}")
+                print(f"  Dataset shape: {'NORTH-ORIENTED (taller than wide)' if result['is_north_oriented'] else 'NOT NORTH-ORIENTED (wider than tall)'}")
+                print(f"  Confidence: {result['confidence'].upper()}")
+            else:
+                print("  ERROR: Could not analyze file")
+        print("\n" + "="*60 + "\n")
+    
+    # Process all files
+    for i, file_path in enumerate(laz_files, 1):
+        print_progress_bar(i, len(laz_files), prefix='Progress:', suffix='Complete', length=50)
+        
+        result = check_file_orientation_enhanced(file_path, debug=args.debug, 
+                                              tolerance_degrees=args.angle_tolerance)
+        
+        if result is not None:
+            checked_count += 1
+            if result['flight_line_angle'] is not None:
+                angle_sum += result['flight_line_angle']
+            confidence_scores[result['confidence']] += 1
+            
+            if result['is_north_oriented']:
+                north_oriented_count += 1
+        else:
+            errors_count += 1
+    
+    # Print summary
+    print("\n" + "=" * 60)
+    print("FLIGHT LINE ORIENTATION ANALYSIS RESULTS")
+    print("=" * 60)
+    print("Total files found: {}".format(total_files))
+    print("Files analyzed: {}".format(len(laz_files)))
+    print("Files processed successfully: {}".format(checked_count))
+    print("Files with errors: {}".format(errors_count))
+    
+    if checked_count > 0:
+        print("\nConfidence levels:")
+        print("  High confidence: {} files".format(confidence_scores['high']))
+        print("  Medium confidence: {} files".format(confidence_scores['medium']))
+        print("  Low confidence: {} files".format(confidence_scores['low']))
+    
+    if checked_count == 0:
+        print("\nCould not verify any files")
+        print("\nSUGGESTIONS:")
+        print("1. Install optional libraries: pip install laspy scikit-learn pyransac3d")
+        print("2. Run with --debug to see more information")
+        print("3. Use --save_lasinfo output.txt to save lasinfo output")
+        print("4. Verify that lasinfo.exe is at: {}".format(LASINFO_PATH))
+    else:
+        avg_angle = angle_sum / checked_count if angle_sum > 0 and checked_count > 0 else 0
+        
+        if len(laz_files) == 1:
+            if north_oriented_count > 0:
+                print("\nFINAL RESULT: Dataset is NORTH-ORIENTED (height > width)")
+            else:
+                print("\nFINAL RESULT: Dataset is NOT north-oriented (width > height)")
+            
+            if avg_angle > 0:
+                print("\nAdditional information:")
+                print("  Flight line orientation: {:.1f}° ({})".format(
+                    avg_angle, get_cardinal_direction(avg_angle)))
+        else:
+            percentage = (north_oriented_count / checked_count) * 100
+            
+            print("\nDataset shape analysis:")
+            print("  North-oriented files (height > width): {} out of {} ({:.1f}%)".format(
+                north_oriented_count, checked_count, percentage))
+            
+            if avg_angle > 0:
+                print("\nFlight line analysis:")
+                print("  Average flight line orientation: {:.1f}°".format(avg_angle))
+                print("  Primary flight direction: {}".format(get_cardinal_direction(avg_angle)))
+            
+            if percentage > args.threshold:
+                print("\nFINAL RESULT: Dataset is NORTH-ORIENTED")
+                print("({:.1f}% of files have height > width, threshold: {}%)".format(
+                    percentage, args.threshold))
+            else:
+                print("\nFINAL RESULT: Dataset is NOT north-oriented")
+                print("({:.1f}% of files have height > width, threshold: {}%)".format(
+                    percentage, args.threshold))
+    
+    printRunTime(stime)
+
+if __name__ == "__main__":
+    main()
