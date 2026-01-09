@@ -1,0 +1,630 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+r"""
+ch_txt.py
+
+Generate full LiDAR dataset documentation blocks using only lines of:
+
+    Setup_lidar_processing <source_root> <STATE> [options...]
+
+What this script does:
+    - Reads a plain text file:
+        * If --input is given: that file.
+        * Else if --dt N is given: \\Hp7\c\Users\admin\OneDrive\Desktop\DATASETS\DATASETS_N(.txt)
+        * Else: DATASETS.txt in the current folder.
+    - Treats any "disk name" line (e.g. Civilization - ds2 usbshare 1, Marshmallow)
+      as the current disk label. A disk label is detected when:
+        * The line does NOT contain "setup_lidar_processing".
+        * The line does NOT contain backslashes "\\".
+        * The line does NOT contain underscores "_".
+        * The line matches only letters, numbers, spaces, and hyphens: ^[A-Za-z0-9\s\-]+$
+        * The line is not a known command line ("Run these commands", "las2terrain", etc.).
+    - Finds all lines that contain "setup_lidar_processing" (case-insensitive),
+      even if they are prefixed with "Z:\>call", and parses them as:
+
+        Setup_lidar_processing <src_root> <STATE> [options...]
+
+    - For each such line it:
+        * Detects the UNC share (e.g. \\ps2\f, \\Hp7\o, etc.).
+        * Detects the state code (KS, OR, ...).
+        * Extracts the dataset base name (e.g. Area1_2012_laz_3744).
+        * Builds a normalized "zm" name (Area1_2012_laz_zm_3744).
+        * Builds a full dataset name with state prefix:
+              KS_Area1_2012_laz_zm_3744
+        * Extracts the EPSG code (e.g. 3744) from the dataset name.
+        * Extracts --sid and --ns if present (otherwise uses defaults).
+        * Ensures there is a --ps value; if missing, adds "--ps 0.5".
+        * Stores the current disk label (if any) for that dataset.
+    - Groups the resulting documentation blocks by UNC share (disk), e.g.:
+
+        Civilization - ds2 usbshare 1
+
+        ============================== DISK: \\ps2\f ==============================
+
+        KS_Area1_2012_laz_3744
+        Setup_lidar_processing ...
+
+    - For each dataset it generates a full "modern" workflow, including:
+
+        - A dataset title line: STATE_datasetBase (e.g. KS_Area1_2012_laz_3744)
+        - Setup_lidar_processing (with ensured --ps)
+        - las2terrain
+        - 3 x "f" (DEM, last_nDSM, first_nDSM)
+        - -----
+        - 3 x gdalbuildvrt (DEM, last, first)
+        - -----
+        - translate for AOI_QC
+        - gdalbuildvrt for AOI_QC
+        - gdaladdo for AOI_QC
+        - --Create cutline before proceeding--
+        - create_elevation_metadata_fields
+        - Fill out metadata fields.
+        - elevation_add_cutline_rank (with year inferred from dataset name)
+        - -----
+        - append_lidar_footprints (DEM, last, first)
+        - -----
+        - del_10k_intersect
+        - update_merged_cutlines
+
+Usage examples
+--------------
+    # Using dt index (looks in your OneDrive\Desktop\DATASETS):
+    ch_txt --dt 1
+      -> input:  \\Hp7\c\Users\admin\OneDrive\Desktop\DATASETS\DATASETS_1(.txt)
+      -> output: \\Hp7\c\Users\admin\OneDrive\Desktop\DATASETS\DATASETS_1_out.txt
+
+    # Explicit input/output in your current folder:
+    python ch_txt.py -i DATASETS.txt -o KS_datasets_out.txt
+"""
+
+import os
+import re
+import sys
+import time
+import argparse
+from typing import List, Optional, Tuple
+from collections import OrderedDict
+
+# Default parameters for the "modern" flow
+PIXELSIZE_DEFAULT = 0.5
+RADIUS_DEFAULT = 1.5
+LL_OPTS = "[-scale_z 3.28083333 ]"
+TARGET_EPSG = "5070"  # for footprint shapefiles
+NS_DEFAULT = "8"
+SID_DEFAULT = "1"
+PS_DEFAULT = "0.5"
+
+# Static disk labels by share (keys in lower-case UNC form).
+# We build the keys from the same UNC pattern that detect_share() returns.
+DISK_LABELS_BY_SHARE = {
+    "\\\\hp7\\L".lower():  "PEACH - hp7\\L",
+    "\\\\hp7\\J".lower():  "CALCIUM - hp7\\J",
+    "\\\\ps3\\K".lower():  "PACIFIC - ps3\\K",
+    "\\\\tsp5\\I".lower(): "TSP5 - tsp5\\I",
+    "\\\\hp5\\L".lower():  "CEDAR - hp5\\L",
+    # Ejemplo para agregar más:
+    # "\\\\ps2\\F".lower():  "Civilization - ds2 usbshare 1",
+    # "\\\\ps2\\G".lower():  "Marshmallow - ps2\\g",
+}
+
+# Your OneDrive Desktop DATASETS directory
+BASE_DESKTOP = r"\\Hp7\c\Users\admin\OneDrive\Desktop"
+DATASETS_DIR = os.path.join(BASE_DESKTOP, "DATASETS")
+
+
+class DatasetDoc:
+    """Simple container for metadata and derived names for each dataset."""
+    def __init__(
+        self,
+        share: str,
+        src_root: str,
+        state: str,
+        setup_opts: str,
+        ds_base: str,
+        ds_zm: str,
+        ds_name: str,
+        epsg_src: str,
+        ns: str,
+        sid: str,
+        disk_label: Optional[str] = None,
+    ):
+        self.share = share          # e.g. \\ps2\f, \\Hp7\o, ...
+        self.src_root = src_root    # full dataset root UNC path
+        self.state = state          # e.g. KS, OR, ...
+        self.setup_opts = setup_opts  # remaining Setup options (with ensured --ps)
+        self.ds_base = ds_base      # e.g. Area1_2012_laz_3744
+        self.ds_zm = ds_zm          # e.g. Area1_2012_laz_zm_3744
+        self.ds_name = ds_name      # e.g. KS_Area1_2012_laz_zm_3744
+        self.epsg_src = epsg_src    # e.g. 3744
+        self.ns = ns
+        self.sid = sid
+        self.disk_label = disk_label  # e.g. Civilization - ds2 usbshare 1, Marshmallow
+
+
+def detect_share(src_root: str) -> str:
+    """
+    From a UNC path like:
+        \\ps2\\f\\Lidar\\KS\\Area1_2012_laz_3744
+    return the share:
+        \\ps2\\f
+    """
+    if not src_root.startswith("\\\\"):
+        return src_root
+
+    parts = src_root.split("\\")
+    if len(parts) >= 4:
+        return "\\\\" + parts[2] + "\\" + parts[3]
+    elif len(parts) >= 3:
+        return "\\\\" + parts[2]
+    else:
+        return src_root
+
+
+def extract_dataset_base(src_root: str) -> str:
+    """Take the last component of the path as dataset base name."""
+    clean = src_root.rstrip("\\")
+    return clean.split("\\")[-1]
+
+
+def make_zm_name(ds_base: str) -> str:
+    """
+    Insert "_zm_" after "_laz_" in the dataset name if not already present.
+    """
+    if "_laz_zm_" in ds_base:
+        return ds_base
+    return ds_base.replace("_laz_", "_laz_zm_")
+
+
+def detect_epsg_from_name(name: str, default: str = "0000") -> str:
+    """Detect a 4-digit EPSG code at the end of the string."""
+    m = re.search(r"(\d{4})$", name)
+    return m.group(1) if m else default
+
+
+def detect_year_from_name(name: str, default: str = "1900") -> str:
+    """Detect a year like 20XX somewhere in the dataset name."""
+    m = re.search(r"(20\d{2})", name)
+    return m.group(1) if m else default
+
+
+def replace_epsg_with_target(name: str, src_epsg: str, target_epsg: str = TARGET_EPSG) -> str:
+    """
+    Replace the trailing EPSG code with the target EPSG.
+    If the name does not end with src_epsg, append "_<target_epsg>".
+    """
+    if name.endswith(src_epsg):
+        return name[: -len(src_epsg)] + target_epsg
+    return f"{name}_{target_epsg}"
+
+
+def parse_ns(opts: str, default: str = NS_DEFAULT) -> str:
+    m = re.search(r"--ns\s+(\d+)", opts)
+    return m.group(1) if m else default
+
+
+def parse_sid(opts: str, default: str = SID_DEFAULT) -> str:
+    m = re.search(r"--sid\s+(\d+)", opts)
+    return m.group(1) if m else default
+
+
+def ensure_ps(opts: str, default_ps: str = PS_DEFAULT) -> str:
+    """
+    Ensure the Setup line options contain a "--ps" parameter.
+    If missing, add "--ps <default_ps>" at the end.
+    """
+    if "--ps" in opts:
+        return opts
+    opts = opts.rstrip()
+    if opts:
+        return opts + f" --ps {default_ps}"
+    else:
+        return f"--ps {default_ps}"
+
+
+def parse_setup_line(line: str, disk_label: Optional[str]) -> Optional[DatasetDoc]:
+    """
+    Parse a normalized Setup_lidar_processing line and build a DatasetDoc.
+
+    Expected format (after normalization):
+        Setup_lidar_processing <src_root> <STATE> [options...]
+    """
+    line = line.strip()
+    if not line.startswith("Setup_lidar_processing"):
+        return None
+
+    m = re.match(r"^Setup_lidar_processing\s+(\S+)\s+(\S+)(.*)$", line)
+    if not m:
+        return None
+
+    src_root = m.group(1)
+    state = m.group(2)
+    opts = m.group(3).strip()
+
+    share = detect_share(src_root)
+
+    ds_base = extract_dataset_base(src_root)
+    ds_zm = make_zm_name(ds_base)
+    ds_name = f"{state}_{ds_zm}"
+    epsg_src = detect_epsg_from_name(ds_base, default="0000")
+
+    ns_val = parse_ns(opts, default=NS_DEFAULT)
+    sid_val = parse_sid(opts, default=SID_DEFAULT)
+    opts_final = ensure_ps(opts, default_ps=PS_DEFAULT)
+
+    return DatasetDoc(
+        share=share,
+        src_root=src_root,
+        state=state,
+        setup_opts=opts_final,
+        ds_base=ds_base,
+        ds_zm=ds_zm,
+        ds_name=ds_name,
+        epsg_src=epsg_src,
+        ns=ns_val,
+        sid=sid_val,
+        disk_label=disk_label,
+    )
+
+
+def is_disk_label_line(stripped: str) -> bool:
+    """
+    Heuristic to detect a drive name line, e.g.:
+        Civilization - ds2 usbshare 1
+        Marshmallow
+    and NOT things like:
+        Statewide_B11_2018
+        ✔✔✔- Area1_2012_laz_3744 - 911 files
+        Run these commands:
+    """
+    lower = stripped.lower()
+
+    # Obvious non-label cases
+    if "setup_lidar_processing" in lower:
+        return False
+    if "\\" in stripped:
+        return False
+    if "_" in stripped:
+        return False
+
+    # Skip lines that clearly look like commands or instructions
+    bad_prefixes = (
+        "run these commands",
+        "las2terrain",
+        "gdalbuildvrt",
+        "gdaladdo",
+        "translate ",
+        "append_lidar_footprints",
+        "del_10k_intersect",
+        "update_merged_cutlines",
+        "create_elevation_metadata_fields",
+        "elevation_add_cutline_rank",
+        "wget_cleanup",
+        "wgetter",
+        "batch_call",
+        "fill out metadata fields",
+        "--create cutline",
+    )
+    for p in bad_prefixes:
+        if lower.startswith(p):
+            return False
+
+    # Status lines like "✔✔✔- Area1_2012..." or similar
+    if "files" in lower:
+        return False
+
+    # Debe tener al menos una letra (evita "-----" y similares)
+    if not re.search(r"[A-Za-z]", stripped):
+        return False
+
+    # Only letters/numbers/spaces/hyphens allowed
+    if not re.match(r"^[A-Za-z0-9\s\-]+$", stripped):
+        return False
+
+    return True
+
+
+def read_setups_from_file(path: str) -> List[DatasetDoc]:
+    """
+    Read the input file and return DatasetDoc list for each Setup line.
+
+    - Disk labels: lines that pass is_disk_label_line(stripped).
+      The current disk label is stored and used for subsequent datasets
+      until another disk label is found.
+    - Setup lines: any line that contains "setup_lidar_processing"
+      (case-insensitive), even if prefixed with "Z:\\>call".
+    - All other lines are ignored.
+    """
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        raw_lines = f.readlines()
+
+    datasets: List[DatasetDoc] = []
+    current_label: Optional[str] = None
+
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        lower = stripped.lower()
+
+        # Disk label line (drive name)
+        if is_disk_label_line(stripped):
+            current_label = stripped
+            continue
+
+        # Setup_lidar_processing line (possibly with prefix)
+        if "setup_lidar_processing" in lower:
+            idx = lower.find("setup_lidar_processing")
+            sub = stripped[idx:]
+            # Normalize the command name for regex parsing
+            if not sub.startswith("Setup_lidar_processing"):
+                sub = "Setup_lidar_processing" + sub[len("setup_lidar_processing"):]
+            doc = parse_setup_line(sub, current_label)
+            if doc:
+                datasets.append(doc)
+            else:
+                sys.stderr.write(f"[WARN] Could not parse Setup line: {stripped}\n")
+            continue
+
+        # Ignore any other lines (status, gdal commands, etc.)
+        continue
+
+    return datasets
+
+
+def group_by_share(datasets: List[DatasetDoc]) -> "OrderedDict[str, List[DatasetDoc]]":
+    """Group datasets by UNC share (disk), preserving first appearance order."""
+    grouped: "OrderedDict[str, List[DatasetDoc]]" = OrderedDict()
+    for ds in datasets:
+        if ds.share not in grouped:
+            grouped[ds.share] = []
+        grouped[ds.share].append(ds)
+    return grouped
+
+
+def resolve_input_output(args) -> Tuple[str, str]:
+    """
+    Decide which input/output paths to use, based on:
+      - explicit -i / -o
+      - or --dt N pointing to your OneDrive\Desktop\DATASETS
+      - or fallbacks in the current folder.
+    """
+    # Input resolution
+    if args.input:
+        in_path = args.input
+    elif args.dt is not None:
+        candidate1 = os.path.join(DATASETS_DIR, f"DATASETS_{args.dt}.txt")
+        candidate2 = os.path.join(DATASETS_DIR, f"DATASETS_{args.dt}")
+        if os.path.isfile(candidate1):
+            in_path = candidate1
+        elif os.path.isfile(candidate2):
+            in_path = candidate2
+        else:
+            local1 = f"DATASETS_{args.dt}.txt"
+            local2 = f"DATASETS_{args.dt}"
+            if os.path.isfile(local1):
+                in_path = local1
+            elif os.path.isfile(local2):
+                in_path = local2
+            else:
+                in_path = candidate1
+    else:
+        in_path = "DATASETS.txt"
+
+    # Output resolution
+    if args.output:
+        out_path = args.output
+    elif args.dt is not None:
+        out_path = os.path.join(DATASETS_DIR, f"DATASETS_{args.dt}_out.txt")
+    else:
+        out_path = "DATASETS_out.txt"
+
+    return in_path, out_path
+
+
+def generate_block_for_dataset(ds: DatasetDoc) -> List[str]:
+    """
+    Generate the full documentation block for a dataset as a list of lines.
+    """
+    lines: List[str] = []
+
+    # 0) Dataset title line: STATE_datasetBase (e.g. KS_Area1_2012_laz_3744)
+    dataset_title = f"{ds.state}_{ds.ds_base}"
+    lines.append(dataset_title)
+    lines.append("")
+
+    # 1) Setup_lidar_processing (with ensured --ps)
+    setup_line = f"Setup_lidar_processing {ds.src_root} {ds.state}"
+    if ds.setup_opts:
+        setup_line += " " + ds.setup_opts
+    lines.append(setup_line)
+    lines.append("")
+
+    # Elevation root for this state
+    elev_root = f"\\\\ds3\\data\\elevation\\{ds.state}"
+
+    # las2terrain source: insert _zm in the last component if needed
+    if "_laz_" in ds.src_root and "_laz_zm_" not in ds.src_root:
+        zm_src_root = ds.src_root.replace("_laz_", "_laz_zm_")
+    else:
+        zm_src_root = ds.src_root
+
+    # 2) las2terrain
+    lt = (
+        f"las2terrain {zm_src_root} {elev_root} "
+        f"--pixelsize {PIXELSIZE_DEFAULT} "
+        f"--radius {RADIUS_DEFAULT} "
+        f"--last_ndsm --last_ndsm_min 5 "
+        f"--epsg_list {ds.epsg_src} "
+        f"--first_ndsm "
+        f"--dtype_dem Float32 --dtype_ndsm UInt16 --dtype_last_ndsm Float32 "
+        f"--first_ndsm_min 0 "
+        f'--ll_opts "{LL_OPTS}" '
+        f"--se laz --sid {ds.sid} --ns {ds.ns}"
+    )
+    lines.append(lt)
+    lines.append("")
+
+    # 3) "f" commands: DEM / last / first
+    dem_dir = f"{elev_root}\\DEM_Float32\\{ds.ds_name}"
+    dem_foot_dir = f"{elev_root}\\DEM_footprints\\{ds.ds_name}"
+    last_dir = f"{elev_root}\\last_nDSM_Float32\\{ds.ds_name}"
+    last_foot_dir = f"{elev_root}\\last_nDSM_footprints\\{ds.ds_name}"
+    first_dir = f"{elev_root}\\first_nDSM_UInt16\\{ds.ds_name}"
+    first_foot_dir = f"{elev_root}\\first_nDSM_footprints\\{ds.ds_name}"
+
+    ds_5070 = replace_epsg_with_target(ds.ds_name, ds.epsg_src, TARGET_EPSG)
+
+    lines.append(f"f {dem_dir} {dem_foot_dir}\\{ds_5070}.shp --t_epsg {TARGET_EPSG}")
+    lines.append("")
+    lines.append(f"f {last_dir} {last_foot_dir}\\{ds_5070}.shp --t_epsg {TARGET_EPSG}")
+    lines.append("")
+    lines.append(f"f {first_dir} {first_foot_dir}\\{ds_5070}.shp --t_epsg {TARGET_EPSG}")
+    lines.append("-----")
+
+    # 4) gdalbuildvrt: DEM / last / first
+    dem_vrt = f"{dem_dir}\\{ds.ds_name}_dem.vrt"
+    last_vrt = f"{last_dir}\\{ds.ds_name}_last.vrt"
+    first_vrt = f"{first_dir}\\{ds.ds_name}_first.vrt"
+
+    lines.append(f"gdalbuildvrt {dem_vrt} {dem_dir}\\*.tif")
+    lines.append("")
+    lines.append(f"gdalbuildvrt {last_vrt} {last_dir}\\*.tif")
+    lines.append("")
+    lines.append(f"gdalbuildvrt {first_vrt} {first_dir}\\*.tif")
+    lines.append("-----")
+
+    # 5) AOI_QC: translate + gdalbuildvrt + gdaladdo
+    aoi_qc_dir = f"C:\\AOI_QC\\{ds.ds_name}"
+    aoi_qc_vrt = f"{aoi_qc_dir}\\{ds.ds_name}_first.vrt"
+
+    lines.append(
+        f'translate {first_dir} {aoi_qc_dir} '
+        f'--t_opts "[-outsize 50% 50% -ot Byte -co compress=JPEG]" --ns {ds.ns}'
+    )
+    lines.append("")
+    lines.append(f"gdalbuildvrt {aoi_qc_vrt} {aoi_qc_dir}\\*.tif")
+    lines.append("")
+    lines.append(f"gdaladdo {aoi_qc_vrt}")
+    lines.append("")
+    lines.append("--Create cutline before proceeding--")
+    lines.append("")
+
+    # 6) AOI_Cutlines + metadata
+    aoi_cut = f"{elev_root}\\AOI_Cutlines\\{ds.ds_name}.shp"
+    year = detect_year_from_name(ds.ds_name, default="1900")
+
+    lines.append(f"create_elevation_metadata_fields {aoi_cut}")
+    lines.append("")
+    lines.append("Fill out metadata fields.")
+    lines.append("")
+    lines.append(f"elevation_add_cutline_rank {first_foot_dir}\\{ds_5070}.shp {aoi_cut} {year}")
+    lines.append("-----")
+
+    # 7) append_lidar_footprints (DEM, last, first)
+    lines.append(f"append_lidar_footprints {dem_foot_dir}\\{ds_5070}.shp {ds.state} DEM")
+    lines.append("")
+    lines.append(f"append_lidar_footprints {last_foot_dir}\\{ds_5070}.shp {ds.state} last_nDSM")
+    lines.append("")
+    lines.append(f"append_lidar_footprints {first_foot_dir}\\{ds_5070}.shp {ds.state} first_nDSM")
+    lines.append("-----")
+
+    # 8) Cleanup and merged cutlines update
+    lines.append(f"del_10k_intersect {aoi_cut}")
+    lines.append("")
+    lines.append("update_merged_cutlines")
+    lines.append("")
+
+    return lines
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate full LiDAR dataset documentation from Setup_lidar_processing lines."
+    )
+    parser.add_argument(
+        "-i", "--input",
+        help="Input text file. If omitted and --dt is used, will look in OneDrive\\Desktop\\DATASETS.",
+        default=None
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Output text file. If omitted and --dt is used, writes DATASETS_<dt>_out.txt in OneDrive\\Desktop\\DATASETS.",
+        default=None
+    )
+    parser.add_argument(
+        "--dt",
+        type=int,
+        choices=[1, 2, 3, 4, 5],
+        help="Optional dataset index (1–5)."
+    )
+    parser.add_argument(
+        "-q", "--quiet",
+        help="Quiet mode (suppress informational messages on stderr).",
+        action="store_true"
+    )
+
+    args = parser.parse_args()
+    verbose = not args.quiet
+
+    in_path, out_path = resolve_input_output(args)
+
+    if not os.path.isfile(in_path):
+        sys.stderr.write(f"[ERROR] Input file not found: {in_path}\n")
+        sys.exit(1)
+
+    datasets = read_setups_from_file(in_path)
+
+    # Asignar / sobreescribir etiqueta estática según el share (case-insensitive)
+    for ds in datasets:
+        key = ds.share.lower()
+        if key in DISK_LABELS_BY_SHARE:
+            ds.disk_label = DISK_LABELS_BY_SHARE[key]
+
+    if verbose:
+        sys.stderr.write(f"[INFO] Detected Setup_lidar_processing lines: {len(datasets)}\n")
+
+    if not datasets:
+        sys.stderr.write("[WARN] No 'Setup_lidar_processing' lines found in the input file.\n")
+
+    grouped = group_by_share(datasets)
+
+    out_lines: List[str] = []
+
+    # Header with generation timestamp
+    header = time.strftime("Generated: %Y-%m-%d %H:%M:%S")
+    out_lines.append(header)
+    out_lines.append("")
+
+    for share, ds_list in grouped.items():
+        # If any dataset on this share has a disk_label, print it once
+        disk_label = None
+        for ds in ds_list:
+            if ds.disk_label:
+                disk_label = ds.disk_label
+                break
+
+        if disk_label:
+            out_lines.append(disk_label)
+            out_lines.append("")
+
+        out_lines.append("=" * 30 + f" DISK: {share} " + "=" * 30)
+        out_lines.append("")
+
+        for ds in ds_list:
+            block = generate_block_for_dataset(ds)
+            out_lines.extend(block)
+            # Soft separator between datasets on the same disk
+            out_lines.append("-" * 78)
+            out_lines.append("")
+
+    # Write output file
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(out_lines).rstrip() + "\n")
+
+    if verbose:
+        sys.stderr.write(f"[INFO] Documentation written to: {out_path}\n")
+
+
+if __name__ == "__main__":
+    main()
