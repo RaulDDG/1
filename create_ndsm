@@ -1,0 +1,231 @@
+#-------------------------------------------------------------------------------
+# Name:        create_ndsm.py
+# Purpose:     Create nDSM tiles from DSM/DTM pairs (nDSM = DSM - DTM)
+#
+# Author:      Raul, rddgamboa@earthdefine.com
+#
+# Created:     12/13/2025
+#-------------------------------------------------------------------------------
+
+import sys, os, glob, time, argparse
+from osgeo import gdal, ogr
+ogr.UseExceptions()
+
+import numpy as np
+
+import sfunctions as s
+import ufunctions as u
+import uconstants as uc
+
+# Constants
+################################################################################
+script_name = os.path.basename(os.path.splitext(__file__)[0])
+
+# Helper functions
+################################################################################
+
+def format_seconds(sec):
+    """Return seconds as mm:ss or hh:mm:ss string."""
+    sec = int(sec)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    else:
+        return f"{m:02d}:{s:02d}"
+
+
+def create_ndsm(dsm_path, dtm_path, out_path, clamp_zero=True):
+    """
+    Compute nDSM = DSM - DTM for a single pair of rasters and write a GeoTIFF.
+
+    - DSM and DTM must have identical extent, resolution, projection and alignment.
+    - If clamp_zero=True, all negative values are forced to 0.0.
+    """
+    dsm_ds = gdal.Open(dsm_path, gdal.GA_ReadOnly)
+    dtm_ds = gdal.Open(dtm_path, gdal.GA_ReadOnly)
+
+    if dsm_ds is None:
+        print(f"[{script_name}] ERROR: could not open DSM: {dsm_path}")
+        return False
+    if dtm_ds is None:
+        print(f"[{script_name}] ERROR: could not open DTM: {dtm_path}")
+        return False
+
+    # Basic checks
+    if dsm_ds.RasterXSize != dtm_ds.RasterXSize or dsm_ds.RasterYSize != dtm_ds.RasterYSize:
+        print(f"[{script_name}] ERROR: size mismatch between DSM and DTM, skipping.")
+        return False
+
+    if dsm_ds.GetGeoTransform() != dtm_ds.GetGeoTransform():
+        print(f"[{script_name}] ERROR: geotransform mismatch between DSM and DTM, skipping.")
+        return False
+
+    if dsm_ds.GetProjection() != dtm_ds.GetProjection():
+        print(f"[{script_name}] WARNING: projection mismatch between DSM and DTM.")
+
+    dsm_band = dsm_ds.GetRasterBand(1)
+    dtm_band = dtm_ds.GetRasterBand(1)
+
+    dsm_nodata = dsm_band.GetNoDataValue()
+    dtm_nodata = dtm_band.GetNoDataValue()
+
+    # Read bands
+    dsm_arr = dsm_band.ReadAsArray().astype(np.float32)
+    dtm_arr = dtm_band.ReadAsArray().astype(np.float32)
+
+    # Mask of valid pixels
+    mask = np.ones_like(dsm_arr, dtype=bool)
+    if dsm_nodata is not None:
+        mask &= (dsm_arr != dsm_nodata)
+    if dtm_nodata is not None:
+        mask &= (dtm_arr != dtm_nodata)
+
+    # Output initialized with nodata
+    out_nodata = -9999.0 if dsm_nodata is None else dsm_nodata
+    ndsm_arr = np.full_like(dsm_arr, out_nodata, dtype=np.float32)
+
+    # Compute nDSM where valid
+    ndsm_valid = dsm_arr[mask] - dtm_arr[mask]
+
+    if clamp_zero:
+        ndsm_valid[ndsm_valid < 0] = 0.0
+
+    ndsm_arr[mask] = ndsm_valid
+
+    # Create output dataset
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    driver = gdal.GetDriverByName("GTiff")
+    out_ds = driver.Create(
+        out_path,
+        dsm_ds.RasterXSize,
+        dsm_ds.RasterYSize,
+        1,
+        gdal.GDT_Float32,
+        ["TILED=YES", "COMPRESS=LZW"]
+    )
+
+    out_ds.SetGeoTransform(dsm_ds.GetGeoTransform())
+    out_ds.SetProjection(dsm_ds.GetProjection())
+
+    out_band = out_ds.GetRasterBand(1)
+    out_band.WriteArray(ndsm_arr)
+    out_band.SetNoDataValue(out_nodata)
+    out_band.FlushCache()
+
+    out_ds = None
+    dsm_ds = None
+    dtm_ds = None
+
+    return True
+
+
+def process_dir(indir, outdir):
+    """
+    Loop over DSM tiles in a directory and create nDSM tiles
+    where a matching DTM exists.
+
+    Expected naming (HRDEM example):
+      dsm_1m_utm11_e_21_165.tif
+      dtm_1m_utm11_e_21_165.tif
+    Output:
+      ndsm_1m_utm11_e_21_165.tif
+    """
+    print(f"[{script_name}] Input directory : {indir}")
+    print(f"[{script_name}] Output directory: {outdir}")
+
+    os.makedirs(outdir, exist_ok=True)
+
+    dsm_list = sorted(glob.glob(os.path.join(indir, "dsm_*.tif")))
+
+    if not dsm_list:
+        print(f"[{script_name}] WARNING: no DSM rasters found in {indir}")
+        return
+
+    total = len(dsm_list)
+    print(f"[{script_name}] Found {total} DSM tiles.")
+    loop_start = time.time()
+    bar_len = 30
+    done = 0
+
+    for idx, dsm_path in enumerate(dsm_list, start=1):
+        dsm_name = os.path.basename(dsm_path)
+        dtm_name = dsm_name.replace("dsm_", "dtm_", 1)
+        ndsm_name = dsm_name.replace("dsm_", "ndsm_", 1)
+
+        dtm_path = os.path.join(indir, dtm_name)
+        out_path = os.path.join(outdir, ndsm_name)
+
+        tile_id = dsm_name.replace("dsm_1m_utm11_", "").replace(".tif", "")
+
+        if not os.path.exists(dtm_path):
+            print(f"\n[{script_name}] SKIP (no DTM): {dsm_name}")
+        elif os.path.exists(out_path):
+            # Already done
+            done += 1
+        else:
+            ok = create_ndsm(dsm_path, dtm_path, out_path, clamp_zero=True)
+            if ok:
+                done += 1
+
+        # ---- Progress bar + ETA ----
+        elapsed = time.time() - loop_start
+        avg_time = elapsed / max(idx, 1)
+        remaining = avg_time * (total - idx)
+
+        filled = int(bar_len * idx / total)
+        bar = "=" * filled + " " * (bar_len - filled)
+        pct = 100.0 * idx / total
+
+        msg = (
+            f"\r[{script_name}] [{bar}] {idx}/{total} "
+            f"({pct:5.1f}%) Done:{done}  "
+            f"Elapsed:{format_seconds(elapsed)} "
+            f"ETA:{format_seconds(remaining)}  "
+            f"Tile:{tile_id}"
+        )
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+# Parse arguments
+################################################################################
+parser = argparse.ArgumentParser(
+    description='Create nDSM tiles from DSM/DTM rasters (nDSM = DSM - DTM)',
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter
+)
+parser.add_argument('input', help='input shapefile or directory containing dsm_*.tif / dtm_*.tif')
+parser.add_argument('outdir', help='output directory for ndsm_*.tif tiles')
+
+if len(sys.argv) == 1:
+    parser.print_help()
+    sys.exit(1)
+
+args = parser.parse_args()
+
+inp = args.input
+outdir = args.outdir
+
+stime = u.printStartTime()
+
+# Code logic
+################################################################################
+
+# If input is a shapefile, use its directory as raster directory.
+if os.path.isdir(inp):
+    raster_dir = inp
+elif os.path.isfile(inp) and inp.lower().endswith(".shp"):
+    raster_dir = os.path.dirname(os.path.abspath(inp))
+    print(f"[{script_name}] INFO: input is a shapefile, using its directory as raster dir: {raster_dir}")
+else:
+    print(f"[{script_name}] ERROR: input must be a directory or a shapefile.")
+    sys.exit(1)
+
+process_dir(raster_dir, outdir)
+
+u.printRunTime(stime)
